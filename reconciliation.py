@@ -1,391 +1,433 @@
-from dataclasses import dataclass
 from io import BytesIO
-from typing import Dict, List, Optional, Tuple
-
 import numpy as np
 import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-TOLERANCE = 1.0  # Strictly < KSh 1.00 is accepted as matched
 
-
-@dataclass
-class SideItem:
-    row_id: int
-    side: str          # "BANK" or "ERP"
-    flow: str          # "DEBIT" or "CREDIT"
-    amount: float      # Positive magnitude
-    date: str
-    reference: str
-    description: str
-    matched: bool = False
-
-
-def _clean_str(val: object) -> str:
-    if val is None or (isinstance(val, float) and np.isnan(val)):
-        return ""
-    return str(val).strip()
-
-
-def _to_float(val: object) -> float:
-    if val is None or (isinstance(val, float) and np.isnan(val)):
-        return 0.0
-    if isinstance(val, (int, float, np.number)):
-        return float(val)
-    cleaned = str(val).replace(",", "").replace("KSh", "").replace("KES", "").strip()
-    if cleaned.startswith("(") and cleaned.endswith(")"):
-        cleaned = "-" + cleaned[1:-1].strip()
-    try:
-        return float(cleaned)
-    except ValueError:
-        return 0.0
-
-
-def _find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-    lower_map = {str(c).strip().lower(): c for c in df.columns}
-    for cand in candidates:
-        if cand.lower() in lower_map:
-            return lower_map[cand.lower()]
-    for col in df.columns:
-        c_low = str(col).strip().lower()
-        if any(cand.lower() in c_low for cand in candidates):
-            return col
+def _clean_amount(value):
+    if pd.isna(value):
+        return None
+    if isinstance(value, (int, float, np.number)):
+        val = float(value)
+        return None if np.isnan(val) else val
+    if isinstance(value, str):
+        cleaned = value.replace(",", "").replace("KSh", "").replace("KES", "").strip()
+        if cleaned.startswith("(") and cleaned.endswith(")"):
+            cleaned = "-" + cleaned[1:-1].strip()
+        try:
+            val = float(cleaned)
+            return None if np.isnan(val) else val
+        except ValueError:
+            return None
     return None
 
 
-def extract_items(df: pd.DataFrame, source_label: str) -> Tuple[List[SideItem], List[SideItem]]:
-    """
-    Splits a Bank or ERP DataFrame into positive-magnitude DEBIT and CREDIT SideItems.
-    Supports either separate Debit/Credit columns or a single Amount column.
-    """
-    date_col = _find_col(df, ["date", "posting date", "tran date", "value date"])
-    ref_col = _find_col(df, ["reference", "ref", "doc no", "document", "cheque", "voucher", "narration ref"])
-    desc_col = _find_col(df, ["description", "narration", "details", "particulars", "memo"])
+def _direction_multiplier(value):
+    if pd.isna(value):
+        return 1.0
+    text = str(value).strip().lower()
+    if any(x in text for x in ["debit", "withdrawal", "payment", "dr"]):
+        return -1.0
+    if any(x in text for x in ["credit", "deposit", "receipt", "cr"]):
+        return 1.0
+    return 1.0
 
-    debit_col = _find_col(df, ["debit", "dr", "withdrawal", "withdrawals", "payment", "payments"])
-    credit_col = _find_col(df, ["credit", "cr", "deposit", "deposits", "receipt", "receipts"])
-    amt_col = _find_col(df, ["amount", "value", "net amount", "signed amount"])
 
-    debits: List[SideItem] = []
-    credits: List[SideItem] = []
+def normalize_transactions(df: pd.DataFrame, mapping: dict, source: str) -> pd.DataFrame:
+    """
+    Normalizes Bank or ERP rows into a clean DataFrame with:
+    source_row, date, reference, description, amount (signed), abs_amount, flow ("DEBIT" or "CREDIT"), source
+    """
+    rows = []
+    date_col = mapping.get("date")
+    ref_col = mapping.get("reference")
+    desc_col = mapping.get("description")
+    debit_col = mapping.get("debit")
+    credit_col = mapping.get("credit")
+    amount_col = mapping.get("amount")
+    direction_col = mapping.get("direction")
 
     for idx, row in df.iterrows():
-        dt = _clean_str(row[date_col]) if date_col else ""
-        ref = _clean_str(row[ref_col]) if ref_col else ""
-        desc = _clean_str(row[desc_col]) if desc_col else ""
+        src_row = int(idx) + 2
+        dt = pd.to_datetime(row[date_col], errors="coerce") if (date_col and date_col in df.columns) else pd.NaT
+        ref = "" if not (ref_col and ref_col in df.columns) or pd.isna(row[ref_col]) else str(row[ref_col]).strip()
+        desc = "" if not (desc_col and desc_col in df.columns) or pd.isna(row[desc_col]) else str(row[desc_col]).strip()
 
         if debit_col or credit_col:
-            dr_val = abs(_to_float(row[debit_col])) if debit_col else 0.0
-            cr_val = abs(_to_float(row[credit_col])) if credit_col else 0.0
+            dr_val = abs(_clean_amount(row[debit_col]) or 0.0) if (debit_col and debit_col in df.columns) else 0.0
+            cr_val = abs(_clean_amount(row[credit_col]) or 0.0) if (credit_col and credit_col in df.columns) else 0.0
 
-            if dr_val > 0 and cr_val == 0:
-                debits.append(SideItem(int(idx), source_label, "DEBIT", dr_val, dt, ref, desc))
-            elif cr_val > 0 and dr_val == 0:
-                credits.append(SideItem(int(idx), source_label, "CREDIT", cr_val, dt, ref, desc))
-            elif dr_val > 0 and cr_val > 0:
-                # If both populated on one row, treat net difference
-                diff = cr_val - dr_val
-                if diff > 0:
-                    credits.append(SideItem(int(idx), source_label, "CREDIT", diff, dt, ref, desc))
-                elif diff < 0:
-                    debits.append(SideItem(int(idx), source_label, "DEBIT", abs(diff), dt, ref, desc))
-        elif amt_col:
-            val = _to_float(row[amt_col])
-            if val < 0:
-                debits.append(SideItem(int(idx), source_label, "DEBIT", abs(val), dt, ref, desc))
-            elif val > 0:
-                credits.append(SideItem(int(idx), source_label, "CREDIT", val, dt, ref, desc))
+            if dr_val > 0.0 and cr_val == 0.0:
+                rows.append({
+                    "source_row": src_row,
+                    "date": dt,
+                    "reference": ref,
+                    "description": desc,
+                    "amount": -dr_val,
+                    "abs_amount": dr_val,
+                    "flow": "DEBIT",
+                    "source": source,
+                })
+            elif cr_val > 0.0 and dr_val == 0.0:
+                rows.append({
+                    "source_row": src_row,
+                    "date": dt,
+                    "reference": ref,
+                    "description": desc,
+                    "amount": cr_val,
+                    "abs_amount": cr_val,
+                    "flow": "CREDIT",
+                    "source": source,
+                })
+            elif dr_val > 0.0 and cr_val > 0.0:
+                net = cr_val - dr_val
+                if net != 0.0:
+                    rows.append({
+                        "source_row": src_row,
+                        "date": dt,
+                        "reference": ref,
+                        "description": desc,
+                        "amount": net,
+                        "abs_amount": abs(net),
+                        "flow": "CREDIT" if net > 0 else "DEBIT",
+                        "source": source,
+                    })
+        elif amount_col and amount_col in df.columns:
+            raw = _clean_amount(row[amount_col])
+            if raw is None or raw == 0.0:
+                continue
+            if direction_col and direction_col in df.columns:
+                mult = _direction_multiplier(row[direction_col])
+                signed_amt = abs(raw) * mult
+            else:
+                signed_amt = raw
+            rows.append({
+                "source_row": src_row,
+                "date": dt,
+                "reference": ref,
+                "description": desc,
+                "amount": signed_amt,
+                "abs_amount": abs(signed_amt),
+                "flow": "CREDIT" if signed_amt > 0 else "DEBIT",
+                "source": source,
+            })
+        else:
+            raise ValueError(f"{source}: valid amount or debit/credit column mapping is required.")
 
-    debits.sort(key=lambda x: (x.amount, x.reference, x.date, x.row_id))
-    credits.sort(key=lambda x: (x.amount, x.reference, x.date, x.row_id))
-    return debits, credits
+    cols = ["source_row", "date", "reference", "description", "amount", "abs_amount", "flow", "source"]
+    if not rows:
+        return pd.DataFrame(columns=cols)
+    return pd.DataFrame(rows, columns=cols)
 
 
-def _match_sorted_lists(
-    bank_items: List[SideItem],
-    erp_items: List[SideItem],
+def _align_opposite_side(
+    bank_side_df: pd.DataFrame,
+    erp_side_df: pd.DataFrame,
     pair_label: str,
-) -> pd.DataFrame:
+    tolerance: float,
+) -> tuple[pd.DataFrame, set, set]:
     """
-    One-to-one matching on sorted lists using strict abs(bank.amount - erp.amount) < TOLERANCE.
-    Ignores dates and descriptions when matching.
-    Preserves unmatched items with blank opposite columns and Variance = Bank - ERP.
+    Sorts both sides ascending by abs_amount, performs strict one-to-one matching
+    where abs(bank_amt - erp_amt) < tolerance (ignoring dates & descriptions),
+    and aligns rows side-by-side with Variance = Bank Amount - ERP Amount.
+    Returns (aligned_df, matched_bank_rows, matched_erp_rows).
     """
-    b_sorted = sorted(bank_items, key=lambda x: (x.amount, x.row_id))
-    e_sorted = sorted(erp_items, key=lambda x: (x.amount, x.row_id))
+    b_sorted = bank_side_df.sort_values(by=["abs_amount", "source_row"], ascending=[True, True]).reset_index(drop=True)
+    e_sorted = erp_side_df.sort_values(by=["abs_amount", "source_row"], ascending=[True, True]).reset_index(drop=True)
 
-    b_matched_to: Dict[int, int] = {}  # b_idx -> e_idx
-    e_used: set = set()
+    n_b = len(b_sorted)
+    n_e = len(e_sorted)
+    b_to_e: dict[int, int] = {}
+    e_used: set[int] = set()
+    matched_b_src_rows: set[int] = set()
+    matched_e_src_rows: set[int] = set()
 
-    # Greedy nearest-within-tolerance pass in ascending bank order
     e_start = 0
-    n_erp = len(e_sorted)
-
-    for b_idx, b_item in enumerate(b_sorted):
-        # Advance start pointer past items far smaller than current bank amount
-        while e_start < n_erp and (b_item.amount - e_sorted[e_start].amount) >= TOLERANCE:
+    for bi in range(n_b):
+        b_amt = float(b_sorted.at[bi, "abs_amount"])
+        while e_start < n_e and (b_amt - float(e_sorted.at[e_start, "abs_amount"])) >= tolerance:
             e_start += 1
 
-        best_e_idx: Optional[int] = None
-        best_diff: float = TOLERANCE
-
-        for e_idx in range(e_start, n_erp):
-            e_item = e_sorted[e_idx]
-            # Since e_sorted is ascending, once e_item.amount - b_item.amount >= TOLERANCE, no later ERP item fits
-            if (e_item.amount - b_item.amount) >= TOLERANCE:
+        best_ei = None
+        best_diff = tolerance
+        for ei in range(e_start, n_e):
+            e_amt = float(e_sorted.at[ei, "abs_amount"])
+            if (e_amt - b_amt) >= tolerance:
                 break
-            if e_idx in e_used:
+            if ei in e_used:
                 continue
-            diff = abs(b_item.amount - e_item.amount)
+            diff = abs(b_amt - e_amt)
             if diff < best_diff:
                 best_diff = diff
-                best_e_idx = e_idx
+                best_ei = ei
                 if best_diff == 0.0:
                     break
 
-        if best_e_idx is not None:
-            b_matched_to[b_idx] = best_e_idx
-            e_used.add(best_e_idx)
+        if best_ei is not None:
+            b_to_e[bi] = best_ei
+            e_used.add(best_ei)
+            matched_b_src_rows.add(int(b_sorted.at[bi, "source_row"]))
+            matched_e_src_rows.add(int(e_sorted.at[best_ei, "source_row"]))
 
-    # Build aligned rows preserving ascending order on each side without dropping unmatched entries
-    rows = []
+    aligned_rows = []
     b_ptr = 0
     e_ptr = 0
 
-    while b_ptr < len(b_sorted) or e_ptr < len(e_sorted):
-        b_item = b_sorted[b_ptr] if b_ptr < len(b_sorted) else None
-        e_item = e_sorted[e_ptr] if e_ptr < len(e_sorted) else None
-
-        # Skip already-consumed ERP items when advancing ERP pointer
-        while e_item is not None and e_ptr in e_used:
+    while b_ptr < n_b or e_ptr < n_e:
+        while e_ptr < n_e and e_ptr in e_used:
             e_ptr += 1
-            e_item = e_sorted[e_ptr] if e_ptr < len(e_sorted) else None
 
-        if b_item is not None and b_ptr in b_matched_to:
-            paired_e_idx = b_matched_to[b_ptr]
-            paired_e = e_sorted[paired_e_idx]
-            b_item.matched = True
-            paired_e.matched = True
-            variance = round(b_item.amount - paired_e.amount, 6)
-            rows.append({
+        has_b = b_ptr < n_b
+        has_e = e_ptr < n_e
+
+        if has_b and b_ptr in b_to_e:
+            ei = b_to_e[b_ptr]
+            b_amt = float(b_sorted.at[b_ptr, "abs_amount"])
+            e_amt = float(e_sorted.at[ei, "abs_amount"])
+            variance = b_amt - e_amt
+            aligned_rows.append({
                 "Pair": pair_label,
                 "Status": "Matched",
-                "Bank Ref": b_item.reference,
-                "Bank Date": b_item.date,
-                "Bank Description": b_item.description,
-                "Bank Amount": b_item.amount,
+                "Bank Row": int(b_sorted.at[b_ptr, "source_row"]),
+                "Bank Ref": b_sorted.at[b_ptr, "reference"],
+                "Bank Date": b_sorted.at[b_ptr, "date"],
+                "Bank Description": b_sorted.at[b_ptr, "description"],
+                "Bank Amount": b_amt,
                 "Variance": variance,
-                "ERP Amount": paired_e.amount,
-                "ERP Description": paired_e.description,
-                "ERP Date": paired_e.date,
-                "ERP Ref": paired_e.reference,
+                "ERP Amount": e_amt,
+                "ERP Description": e_sorted.at[ei, "description"],
+                "ERP Date": e_sorted.at[ei, "date"],
+                "ERP Ref": e_sorted.at[ei, "reference"],
+                "ERP Row": int(e_sorted.at[ei, "source_row"]),
             })
             b_ptr += 1
-
-        elif b_item is not None and (e_item is None or b_item.amount <= e_item.amount):
-            # Unmatched Bank item (Bank-only -> positive Bank Amount, Variance = Bank - 0 = +Bank)
-            rows.append({
+        elif has_b and (not has_e or float(b_sorted.at[b_ptr, "abs_amount"]) <= float(e_sorted.at[e_ptr, "abs_amount"])):
+            b_amt = float(b_sorted.at[b_ptr, "abs_amount"])
+            aligned_rows.append({
                 "Pair": pair_label,
                 "Status": "Bank Only",
-                "Bank Ref": b_item.reference,
-                "Bank Date": b_item.date,
-                "Bank Description": b_item.description,
-                "Bank Amount": b_item.amount,
-                "Variance": b_item.amount,
+                "Bank Row": int(b_sorted.at[b_ptr, "source_row"]),
+                "Bank Ref": b_sorted.at[b_ptr, "reference"],
+                "Bank Date": b_sorted.at[b_ptr, "date"],
+                "Bank Description": b_sorted.at[b_ptr, "description"],
+                "Bank Amount": b_amt,
+                "Variance": b_amt,
                 "ERP Amount": np.nan,
                 "ERP Description": "",
-                "ERP Date": "",
+                "ERP Date": pd.NaT,
                 "ERP Ref": "",
+                "ERP Row": np.nan,
             })
             b_ptr += 1
-
-        elif e_item is not None:
-            # Unmatched ERP item (ERP-only -> ERP Amount shown, Variance = 0 - ERP = -ERP)
-            rows.append({
+        elif has_e:
+            e_amt = float(e_sorted.at[e_ptr, "abs_amount"])
+            aligned_rows.append({
                 "Pair": pair_label,
                 "Status": "ERP Only",
+                "Bank Row": np.nan,
                 "Bank Ref": "",
-                "Bank Date": "",
+                "Bank Date": pd.NaT,
                 "Bank Description": "",
                 "Bank Amount": np.nan,
-                "Variance": -e_item.amount,
-                "ERP Amount": e_item.amount,
-                "ERP Description": e_item.description,
-                "ERP Date": e_item.date,
-                "ERP Ref": e_item.reference,
+                "Variance": -e_amt,
+                "ERP Amount": e_amt,
+                "ERP Description": e_sorted.at[e_ptr, "description"],
+                "ERP Date": e_sorted.at[e_ptr, "date"],
+                "ERP Ref": e_sorted.at[e_ptr, "reference"],
+                "ERP Row": int(e_sorted.at[e_ptr, "source_row"]),
             })
             e_ptr += 1
 
-    return pd.DataFrame(rows)
-
-
-def _flag_investigation_items(items: List[SideItem], side_name: str, flow_name: str) -> pd.DataFrame:
-    """
-    Flags unmatched items and duplicate-amount clusters where at least one item is unmatched
-    or multiple identical amounts exist.
-    """
-    amount_counts: Dict[float, int] = {}
-    for it in items:
-        amount_counts[it.amount] = amount_counts.get(it.amount, 0) + 1
-
-    flagged = []
-    for it in items:
-        is_dup_amt = amount_counts[it.amount] > 1
-        if not it.matched or is_dup_amt:
-            reasons = []
-            if not it.matched:
-                reasons.append("Unmatched")
-            if is_dup_amt:
-                reasons.append(f"Duplicate amount ({amount_counts[it.amount]}x)")
-            flagged.append({
-                "Source": side_name,
-                "Side": flow_name,
-                "Matched": "Yes" if it.matched else "No",
-                "Reason": " & ".join(reasons),
-                "Amount": it.amount,
-                "Date": it.date,
-                "Reference": it.reference,
-                "Description": it.description,
-            })
-    return pd.DataFrame(flagged)
-
-
-def run_reconciliation(bank_df: pd.DataFrame, erp_df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
-    bank_dr, bank_cr = extract_items(bank_df, "BANK")
-    erp_dr, erp_cr = extract_items(erp_df, "ERP")
-
-    # Opposite accounting sides:
-    # Bank Debits <-> ERP Credits
-    # Bank Credits <-> ERP Debits
-    dr_vs_cr_df = _match_sorted_lists(bank_dr, erp_cr, "Bank Debits vs ERP Credits")
-    cr_vs_dr_df = _match_sorted_lists(bank_cr, erp_dr, "Bank Credits vs ERP Debits")
-
-    combined_df = pd.concat([dr_vs_cr_df, cr_vs_dr_df], ignore_index=True)
-
-    matched_df = combined_df[combined_df["Status"] == "Matched"].copy()
-    bank_only_df = combined_df[combined_df["Status"] == "Bank Only"].copy()
-    erp_only_df = combined_df[combined_df["Status"] == "ERP Only"].copy()
-
-    all_side_items = bank_dr + bank_cr + erp_dr + erp_cr
-    inv_parts = [
-        _flag_investigation_items(bank_dr, "Bank", "Debit"),
-        _flag_investigation_items(bank_cr, "Bank", "Credit"),
-        _flag_investigation_items(erp_dr, "ERP", "Debit"),
-        _flag_investigation_items(erp_cr, "ERP", "Credit"),
+    cols = [
+        "Pair", "Status", "Bank Row", "Bank Ref", "Bank Date", "Bank Description",
+        "Bank Amount", "Variance", "ERP Amount", "ERP Description", "ERP Date", "ERP Ref", "ERP Row"
     ]
-    investigation_df = pd.concat([p for p in inv_parts if not p.empty], ignore_index=True) if any(not p.empty for p in inv_parts) else pd.DataFrame(
-        columns=["Source", "Side", "Matched", "Reason", "Amount", "Date", "Reference", "Description"]
+    df_out = pd.DataFrame(aligned_rows, columns=cols) if aligned_rows else pd.DataFrame(columns=cols)
+    return df_out, matched_b_src_rows, matched_e_src_rows
+
+
+def _build_investigation_df(side_df: pd.DataFrame, matched_rows: set, source_label: str) -> pd.DataFrame:
+    if side_df.empty:
+        return pd.DataFrame(columns=["Source", "Flow", "Matched", "Reason", "Amount", "Date", "Reference", "Description", "Source Row"])
+
+    counts = side_df["abs_amount"].value_counts().to_dict()
+    flagged = []
+    for _, r in side_df.iterrows():
+        srow = int(r["source_row"])
+        amt = float(r["abs_amount"])
+        is_matched = srow in matched_rows
+        dup_cnt = int(counts.get(amt, 1))
+        is_dup = dup_cnt > 1
+
+        if not is_matched or is_dup:
+            reasons = []
+            if not is_matched:
+                reasons.append("Unmatched")
+            if is_dup:
+                reasons.append(f"Duplicate amount ({dup_cnt}x)")
+            flagged.append({
+                "Source": source_label,
+                "Flow": r["flow"],
+                "Matched": "Yes" if is_matched else "No",
+                "Reason": " & ".join(reasons),
+                "Amount": amt,
+                "Date": r["date"],
+                "Reference": r["reference"],
+                "Description": r["description"],
+                "Source Row": srow,
+            })
+
+    cols = ["Source", "Flow", "Matched", "Reason", "Amount", "Date", "Reference", "Description", "Source Row"]
+    return pd.DataFrame(flagged, columns=cols) if flagged else pd.DataFrame(columns=cols)
+
+
+def reconcile(bank: pd.DataFrame, cashbook: pd.DataFrame, tolerance: float = 1.0) -> dict:
+    if tolerance <= 0:
+        raise ValueError("Tolerance must be greater than zero.")
+
+    bank_dr = bank[bank["flow"] == "DEBIT"]
+    bank_cr = bank[bank["flow"] == "CREDIT"]
+    erp_dr = cashbook[cashbook["flow"] == "DEBIT"]
+    erp_cr = cashbook[cashbook["flow"] == "CREDIT"]
+
+    # Bank Debits <-> ERP Credits; Bank Credits <-> ERP Debits
+    dr_vs_cr, m_b_dr, m_e_cr = _align_opposite_side(bank_dr, erp_cr, "Bank Debits vs ERP Credits", tolerance)
+    cr_vs_dr, m_b_cr, m_e_dr = _align_opposite_side(bank_cr, erp_dr, "Bank Credits vs ERP Debits", tolerance)
+
+    all_df = pd.concat([dr_vs_cr, cr_vs_dr], ignore_index=True)
+    matched_df = all_df[all_df["Status"] == "Matched"].copy()
+    bank_only_df = all_df[all_df["Status"] == "Bank Only"].copy()
+    erp_only_df = all_df[all_df["Status"] == "ERP Only"].copy()
+
+    matched_bank_all = m_b_dr | m_b_cr
+    matched_erp_all = m_e_dr | m_e_cr
+
+    inv_parts = [
+        _build_investigation_df(bank_dr, matched_bank_all, "BANK"),
+        _build_investigation_df(bank_cr, matched_bank_all, "BANK"),
+        _build_investigation_df(erp_dr, matched_erp_all, "ERP"),
+        _build_investigation_df(erp_cr, matched_erp_all, "ERP"),
+    ]
+    non_empty_inv = [p for p in inv_parts if not p.empty]
+    investigate_df = pd.concat(non_empty_inv, ignore_index=True) if non_empty_inv else pd.DataFrame(
+        columns=["Source", "Flow", "Matched", "Reason", "Amount", "Date", "Reference", "Description", "Source Row"]
     )
 
-    total_bank = sum(x.amount for x in bank_dr) + sum(x.amount for x in bank_cr)
-    total_erp = sum(x.amount for x in erp_dr) + sum(x.amount for x in erp_cr)
+    total_bank_amt = float(bank["abs_amount"].sum()) if not bank.empty else 0.0
+    total_erp_amt = float(cashbook["abs_amount"].sum()) if not cashbook.empty else 0.0
     matched_bank_amt = float(matched_df["Bank Amount"].sum()) if not matched_df.empty else 0.0
     matched_erp_amt = float(matched_df["ERP Amount"].sum()) if not matched_df.empty else 0.0
     outstanding_bank_amt = float(bank_only_df["Bank Amount"].sum()) if not bank_only_df.empty else 0.0
     outstanding_erp_amt = float(erp_only_df["ERP Amount"].sum()) if not erp_only_df.empty else 0.0
-    total_variance = float(combined_df["Variance"].sum()) if not combined_df.empty else 0.0
+    net_variance = float(all_df["Variance"].sum()) if not all_df.empty else 0.0
 
-    summary_df = pd.DataFrame([
-        {"Metric": "Total Bank Transactions (Amount)", "Value": round(total_bank, 2)},
-        {"Metric": "Total ERP Transactions (Amount)", "Value": round(total_erp, 2)},
-        {"Metric": "Matched Bank Amount", "Value": round(matched_bank_amt, 2)},
-        {"Metric": "Matched ERP Amount", "Value": round(matched_erp_amt, 2)},
-        {"Metric": "Outstanding Bank Items (Green)", "Value": round(outstanding_bank_amt, 2)},
-        {"Metric": "Outstanding ERP Items (Red)", "Value": round(outstanding_erp_amt, 2)},
-        {"Metric": "Net Variance (Bank - ERP)", "Value": round(total_variance, 2)},
-        {"Metric": "Matched Transaction Count", "Value": int(len(matched_df))},
-        {"Metric": "Bank-Only Transaction Count", "Value": int(len(bank_only_df))},
-        {"Metric": "ERP-Only Transaction Count", "Value": int(len(erp_only_df))},
-        {"Metric": "Items Flagged for Investigation", "Value": int(len(investigation_df))},
+    summary_table = pd.DataFrame([
+        {"Metric": "Total Bank Amount", "Value": total_bank_amt},
+        {"Metric": "Total ERP Amount", "Value": total_erp_amt},
+        {"Metric": "Matched Bank Amount", "Value": matched_bank_amt},
+        {"Metric": "Matched ERP Amount", "Value": matched_erp_amt},
+        {"Metric": "Outstanding Bank Amount (Green)", "Value": outstanding_bank_amt},
+        {"Metric": "Outstanding ERP Amount (Red)", "Value": outstanding_erp_amt},
+        {"Metric": "Net Variance (Bank - ERP)", "Value": net_variance},
+        {"Metric": "Matched Pairs Count", "Value": int(len(matched_df))},
+        {"Metric": "Bank-Only Count", "Value": int(len(bank_only_df))},
+        {"Metric": "ERP-Only Count", "Value": int(len(erp_only_df))},
+        {"Metric": "Items Flagged for Investigation", "Value": int(len(investigate_df))},
     ])
 
+    summary = {
+        "matched": int(len(matched_df)),
+        "bank_only": int(len(bank_only_df)),
+        "erp_only": int(len(erp_only_df)),
+        "potential_duplicates": int(len(investigate_df)),
+        "net_variance": net_variance,
+        "total_bank_amount": total_bank_amt,
+        "total_erp_amount": total_erp_amt,
+        "outstanding_bank_amount": outstanding_bank_amt,
+        "outstanding_erp_amount": outstanding_erp_amt,
+    }
+
     return {
-        "Bank Debits vs ERP Credits": dr_vs_cr_df,
-        "Bank Credits vs ERP Debits": cr_vs_dr_df,
-        "Matched Transactions": matched_df,
-        "Bank-Only Transactions": bank_only_df,
-        "ERP-Only Transactions": erp_only_df,
-        "Investigation & Duplicates": investigation_df,
-        "Reconciliation Summary": summary_df,
-        "All Side Items": pd.DataFrame([vars(x) for x in all_side_items]),
+        "summary": summary,
+        "summary_table": summary_table,
+        "debits_vs_credits": dr_vs_cr,
+        "credits_vs_debits": cr_vs_dr,
+        "matched": matched_df,
+        "bank_only": bank_only_df,
+        "erp_only": erp_only_df,
+        "investigate": investigate_df,
+        "all": all_df,
     }
 
 
-def _write_styled_sheet(ws, df: pd.DataFrame, highlight_status: bool = False) -> None:
+def build_reconciliation_excel(results: dict) -> bytes:
+    wb = Workbook()
+    wb.remove(wb.active)
+
     green_fill = PatternFill(start_color="D9EAD3", end_color="D9EAD3", fill_type="solid")
     red_fill = PatternFill(start_color="F4CCCC", end_color="F4CCCC", fill_type="solid")
     header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
     header_font = Font(color="FFFFFF", bold=True)
 
-    if df.empty:
-        ws.append(["No records in this section."])
-        return
-
-    cols = list(df.columns)
-    ws.append(cols)
-    for c_idx in range(1, len(cols) + 1):
-        cell = ws.cell(row=1, column=c_idx)
-        cell.fill = header_fill
-        cell.font = header_font
-
-    status_col_idx = cols.index("Status") + 1 if "Status" in cols else None
-
-    for _, r in df.iterrows():
-        row_vals = [None if (isinstance(r[c], float) and np.isnan(r[c])) else r[c] for c in cols]
-        ws.append(row_vals)
-        current_row = ws.max_row
-
-        row_fill = None
-        if highlight_status and status_col_idx:
-            st = str(r["Status"])
-            if st == "Bank Only":
-                row_fill = green_fill
-            elif st == "ERP Only":
-                row_fill = red_fill
-
-        if row_fill:
-            for c_idx in range(1, len(cols) + 1):
-                ws.cell(row=current_row, column=c_idx).fill = row_fill
-
-    # Format numeric columns without destroying exact precision
-    num_headers = {"Bank Amount", "Variance", "ERP Amount", "Amount", "Value"}
-    for c_idx, col_name in enumerate(cols, start=1):
-        if col_name in num_headers:
-            for r_idx in range(2, ws.max_row + 1):
-                cell = ws.cell(row=r_idx, column=c_idx)
-                if isinstance(cell.value, (int, float)):
-                    cell.number_format = "#,##0.00"
-
-    # Auto-fit column widths with a sensible cap
-    for c_idx, col_name in enumerate(cols, start=1):
-        max_len = len(str(col_name))
-        for r_idx in range(2, min(ws.max_row + 1, 200)):
-            val_str = str(ws.cell(row=r_idx, column=c_idx).value or "")
-            max_len = max(max_len, len(val_str))
-        ws.column_dimensions[get_column_letter(c_idx)].width = min(max_len + 4, 42)
-
-
-def export_to_excel(results: Dict[str, pd.DataFrame]) -> bytes:
-    wb = Workbook()
-    # Remove default sheet
-    wb.remove(wb.active)
-
-    sheet_order = [
-        ("Bank Debits vs ERP Credits", True),
-        ("Bank Credits vs ERP Debits", True),
-        ("Matched Transactions", False),
-        ("Bank-Only Transactions", True),
-        ("ERP-Only Transactions", True),
-        ("Investigation & Duplicates", False),
-        ("Reconciliation Summary", False),
+    sheets = [
+        ("Bank Debits vs ERP Credits", results.get("debits_vs_credits"), True),
+        ("Bank Credits vs ERP Debits", results.get("credits_vs_debits"), True),
+        ("Matched", results.get("matched"), False),
+        ("Bank Only", results.get("bank_only"), True),
+        ("ERP Only", results.get("erp_only"), True),
+        ("Needs Investigation", results.get("investigate"), False),
+        ("Summary Totals", results.get("summary_table"), False),
     ]
 
-    for sheet_name, do_highlight in sheet_order:
-        ws = wb.create_sheet(title=sheet_name[:31])
-        df = results.get(sheet_name, pd.DataFrame())
-        _write_styled_sheet(ws, df, highlight_status=do_highlight)
+    for title, df, color_rows in sheets:
+        ws = wb.create_sheet(title=title[:31])
+        if df is None or df.empty:
+            ws.append(["No records"])
+            continue
+
+        cols = list(df.columns)
+        ws.append(cols)
+        for c_idx in range(1, len(cols) + 1):
+            cell = ws.cell(row=1, column=c_idx)
+            cell.fill = header_fill
+            cell.font = header_font
+
+        status_idx = cols.index("Status") if "Status" in cols else None
+
+        for _, r in df.iterrows():
+            row_vals = []
+            for c in cols:
+                val = r[c]
+                if pd.isna(val):
+                    row_vals.append(None)
+                elif isinstance(val, pd.Timestamp):
+                    row_vals.append(val.to_pydatetime())
+                else:
+                    row_vals.append(val)
+            ws.append(row_vals)
+            cur_row = ws.max_row
+
+            if color_rows and status_idx is not None:
+                st = str(r.iloc[status_idx])
+                fill = green_fill if st == "Bank Only" else (red_fill if st == "ERP Only" else None)
+                if fill:
+                    for c_idx in range(1, len(cols) + 1):
+                        ws.cell(row=cur_row, column=c_idx).fill = fill
+
+        num_cols = {"Bank Amount", "Variance", "ERP Amount", "Amount", "Value"}
+        for c_idx, col_name in enumerate(cols, start=1):
+            if col_name in num_cols:
+                for r_idx in range(2, ws.max_row + 1):
+                    cell = ws.cell(row=r_idx, column=c_idx)
+                    if isinstance(cell.value, (int, float)):
+                        cell.number_format = "#,##0.00"
+
+            max_len = len(str(col_name))
+            for r_idx in range(2, min(ws.max_row + 1, 250)):
+                max_len = max(max_len, len(str(ws.cell(row=r_idx, column=c_idx).value or "")))
+            ws.column_dimensions[get_column_letter(c_idx)].width = min(max_len + 4, 42)
 
     buf = BytesIO()
     wb.save(buf)
