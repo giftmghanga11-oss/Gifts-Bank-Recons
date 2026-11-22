@@ -29,7 +29,7 @@ left, right = st.columns(2)
 with left:
     bank_file = st.file_uploader("Bank statement", type=["xlsx", "xls", "csv"], key="bank")
 with right:
-    cash_file = st.file_uploader("ERP cashbook", type=["xlsx", "xls", "csv"], key="cash")
+    cash_file = st.file_uploader("Cashbook", type=["xlsx", "xls", "csv"], key="cash")
 
 
 def read_upload(upload):
@@ -204,4 +204,4 @@ if bank_file and cash_file:
             type="primary",
         )
 else:
-    st.markdown("Upload both files to generate the side-by-side bank reconciliation report.")
+    st.markdown("Upload files to generate bank reconciliation.")
