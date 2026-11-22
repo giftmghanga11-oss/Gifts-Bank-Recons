@@ -10,8 +10,8 @@ from reconciliation import (
 )
 
 st.set_page_config(page_title="Bank Reconciliation", page_icon="🏦", layout="wide")
-st.title("🏦 Automated Bank Reconciliation")
-st.caption("Bank details on the left • Variance in the middle • Cashbook details on the right")
+st.title("🏦 Bank Reconciliation")
+st.caption("Bank details • Variance • Cashbook")
 
 with st.sidebar:
     st.header("Reconciliation settings")
