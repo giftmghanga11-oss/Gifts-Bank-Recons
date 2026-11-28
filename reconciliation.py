@@ -20,6 +20,7 @@ EXCEL_EPOCH = datetime.datetime(1899, 12, 30)
 NONE_CHOICE = "(none)"
 
 IN, OUT = "IN", "OUT"
+REVERSAL_STATUSES = ("ERP Reversal", "Bank Reversal")
 SECTION_LABELS = {
     IN: "Money in: bank credits vs ERP receipts",
     OUT: "Money out: bank debits vs ERP payments",
@@ -240,7 +241,54 @@ def _align_side(bank_side: pd.DataFrame, erp_side: pd.DataFrame, section: str, t
     return records
 
 
-def reconcile(bank: pd.DataFrame, cashbook: pd.DataFrame, tolerance: float = 1.0, mapping: dict | None = None) -> dict:
+def _pair_reversals(records: list[dict], tolerance: float) -> list[dict]:
+    """
+    An unmatched entry on the money-in side and an unmatched entry of the same amount on the money-out
+    side, both on the SAME statement, are an entry and its reversal:
+      * ERP Only (in)  + ERP Only (out)  -> "ERP Reversal"   (posted, then reversed in the cashbook)
+      * Bank Only (in) + Bank Only (out) -> "Bank Reversal"  (credited, then debited back by the bank)
+    The two legs are moved to a block at the bottom, side by side in adjacent rows. The second leg's
+    variance is flipped, so each pair nets to nil and no longer shows as an unreconciled difference.
+    One-to-one: each entry is used at most once; the difference must be strictly less than tolerance.
+    """
+    in_label, out_label = SECTION_LABELS[IN], SECTION_LABELS[OUT]
+    amount = lambda i: abs(records[i]["variance_val"])
+    pairs = []  # (new_status, in_index, out_index)
+    for status, new_status in (("ERP Only", "ERP Reversal"), ("Bank Only", "Bank Reversal")):
+        ins = sorted((i for i, r in enumerate(records) if r["status"] == status and r["section"] == in_label), key=amount)
+        outs = [i for i, r in enumerate(records) if r["status"] == status and r["section"] == out_label]
+        used = set()
+        for i in ins:
+            best, best_diff = None, tolerance
+            for j in outs:
+                if j in used:
+                    continue
+                diff = abs(amount(i) - amount(j))
+                if diff < best_diff:
+                    best, best_diff = j, diff
+            if best is not None:
+                used.add(best)
+                pairs.append((new_status, i, best))
+
+    if not pairs:
+        return records
+    moved = {i for _, i, j in pairs} | {j for _, i, j in pairs}
+    kept = [r for k, r in enumerate(records) if k not in moved]
+    block = []
+    for new_status, i, j in sorted(pairs, key=lambda p: (amount(p[1]), p[0])):
+        first = dict(records[i], status=new_status, reversal_leg="in")
+        second = dict(records[j], status=new_status, reversal_leg="out", variance_val=-records[j]["variance_val"])
+        block += [first, second]
+    return kept + block
+
+
+def reconcile(
+    bank: pd.DataFrame,
+    cashbook: pd.DataFrame,
+    tolerance: float = 1.0,
+    mapping: dict | None = None,
+    pair_reversals: bool = True,
+) -> dict:
     """`mapping` = {"bank_in","bank_out","erp_in","erp_out"} (column names or None); used for the Excel formulas."""
     if tolerance <= 0:
         raise ValueError("Tolerance must be greater than zero.")
@@ -253,6 +301,9 @@ def reconcile(bank: pd.DataFrame, cashbook: pd.DataFrame, tolerance: float = 1.0
         records += _align_side(
             bank[bank["flow"] == flow], cashbook[cashbook["flow"] == flow], SECTION_LABELS[flow], tolerance
         )
+
+    if pair_reversals:
+        records = _pair_reversals(records, tolerance)
 
     preview_rows, statuses = [], []
     for rec in records:
@@ -278,6 +329,8 @@ def reconcile(bank: pd.DataFrame, cashbook: pd.DataFrame, tolerance: float = 1.0
             "matched": statuses.count("Matched"),
             "bank_only": statuses.count("Bank Only"),
             "erp_only": statuses.count("ERP Only"),
+            "erp_reversals": statuses.count("ERP Reversal") // 2,
+            "bank_reversals": statuses.count("Bank Reversal") // 2,
             "net_variance": float(sum(r["variance_val"] for r in records)),
             "bank_rows": len(bank),
             "erp_rows": len(cashbook),
@@ -299,6 +352,8 @@ def build_reconciliation_excel(results: dict) -> bytes:
     green = PatternFill(start_color="D9EAD3", end_color="D9EAD3", fill_type="solid")
     red = PatternFill(start_color="F4CCCC", end_color="F4CCCC", fill_type="solid")
     grey = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
+    yellow = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+    blue = PatternFill(start_color="CFE2F3", end_color="CFE2F3", fill_type="solid")
     bold = Font(bold=True)
     var_font = Font(color="FF0000")
 
@@ -349,12 +404,14 @@ def build_reconciliation_excel(results: dict) -> bytes:
             b_ref = f"ABS({cfg['b_letter']}{r})" if cfg["b_abs"] else f"{cfg['b_letter']}{r}"
             e_ref = f"ABS({cfg['e_letter']}{r})" if cfg["e_abs"] else f"{cfg['e_letter']}{r}"
             cell.value = f"={b_ref}-{e_ref}"
+            if rec.get("reversal_leg") == "out":      # reversal leg: flipped so the pair nets to nil
+                cell.value = f"=-({b_ref}-{e_ref})"
         else:
             cell.value = rec["variance_val"]
         cell.number_format = "#,##0.00"
         cell.font = var_font
 
-        fill = green if rec["status"] == "Bank Only" else red if rec["status"] == "ERP Only" else None
+        fill = {"Bank Only": green, "ERP Only": red, "ERP Reversal": yellow, "Bank Reversal": blue}.get(rec["status"])
         if fill:
             for c in range(1, len(headers) + 1):
                 ws.cell(row=r, column=c).fill = fill
