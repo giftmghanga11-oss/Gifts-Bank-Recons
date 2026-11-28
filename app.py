@@ -10,8 +10,8 @@ from reconciliation import (
 )
 
 st.set_page_config(page_title="Bank Reconciliation", page_icon="🏦", layout="wide")
-st.title("🏦 Bank Reconciliation")
-st.caption("Bank details • Variance • Cashbook")
+st.title("🏦 Automated Bank Reconciliation")
+st.caption("Bank details on the left • Variance in the middle • Cashbook details on the right")
 
 with st.sidebar:
     st.header("Reconciliation settings")
@@ -23,13 +23,19 @@ with st.sidebar:
         format="%.2f",
         help="Entries are matched only when the difference is strictly less than this amount.",
     )
+    pair_reversals = st.checkbox(
+        "Auto-reconcile reversals",
+        value=True,
+        help="Same amount unmatched on both the money-in and money-out side of the SAME statement "
+             "(e.g. ERP credit and ERP debit, or bank credit and bank debit) is treated as an entry and its reversal.",
+    )
 
 st.subheader("1. Upload your files")
 left, right = st.columns(2)
 with left:
     bank_file = st.file_uploader("Bank statement", type=["xlsx", "xls", "csv"], key="bank")
 with right:
-    cash_file = st.file_uploader("Cashbook", type=["xlsx", "xls", "csv"], key="cash")
+    cash_file = st.file_uploader("ERP cashbook", type=["xlsx", "xls", "csv"], key="cash")
 
 
 def read_upload(upload):
@@ -54,6 +60,10 @@ def style_report(df: pd.DataFrame, statuses: list[str]):
             return ["background-color: #d9ead3; color: #1b4332"] * len(row)
         if status == "ERP Only":
             return ["background-color: #f4cccc; color: #7f1d1d"] * len(row)
+        if status == "ERP Reversal":
+            return ["background-color: #fff2cc; color: #7f6000"] * len(row)
+        if status == "Bank Reversal":
+            return ["background-color: #cfe2f3; color: #0b3d6b"] * len(row)
         return [""] * len(row)
 
     return df.style.apply(row_style, axis=1)
@@ -166,7 +176,7 @@ if bank_file and cash_file:
             )
             st.session_state["reconciliation"] = {
                 "signature": signature,
-                "results": reconcile(bank_tx, erp_tx, tolerance=tolerance, mapping=mapping),
+                "results": reconcile(bank_tx, erp_tx, tolerance=tolerance, mapping=mapping, pair_reversals=pair_reversals),
             }
         except Exception as exc:
             st.session_state.pop("reconciliation", None)
@@ -178,11 +188,16 @@ if bank_file and cash_file:
         summary = results["summary"]
 
         st.subheader("4. Reconciliation report")
-        m1, m2, m3, m4 = st.columns(4)
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
         m1.metric("Matched pairs", summary["matched"])
         m2.metric("Bank only (green)", summary["bank_only"])
         m3.metric("Cashbook only (red)", summary["erp_only"])
-        m4.metric("Net variance", f"{summary['net_variance']:,.2f}")
+        m4.metric("ERP reversals (yellow)", summary["erp_reversals"])
+        m5.metric("Bank reversals (blue)", summary["bank_reversals"])
+        m6.metric("Net variance", f"{summary['net_variance']:,.2f}")
+        if summary["erp_reversals"] or summary["bank_reversals"]:
+            st.caption("Reversal pairs are listed at the bottom, two rows each (entry, then its reversal); "
+                       "their variances cancel to nil.")
 
         if results["skipped"]:
             st.warning(
@@ -204,4 +219,4 @@ if bank_file and cash_file:
             type="primary",
         )
 else:
-    st.markdown("Upload files to generate bank reconciliation.")
+    st.markdown("Upload both files to generate the side-by-side bank reconciliation report.")
