@@ -310,9 +310,15 @@ def reconcile(
         b_raw = rec["bank_raw"] or {}
         e_raw = rec["erp_raw"] or {}
         row = {c: b_raw.get(c) for c in bank_cols}
-        row["Variance"] = rec["variance_val"]
+        var_name = "Variance"
+        while var_name in row:
+            var_name += " (calc)"
+        row[var_name] = rec["variance_val"]
         for c in erp_cols:
-            row[f"{c}_ERP" if c in row else c] = e_raw.get(c)
+            name = c
+            while name in row:          # keep every report column name unique (the styler needs this)
+                name += "_ERP"
+            row[name] = e_raw.get(c)
         preview_rows.append(row)
         statuses.append(rec["status"])
 
