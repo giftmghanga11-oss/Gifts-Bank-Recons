@@ -9,6 +9,9 @@ from reconciliation import (
     repair_cashbook_dataframe,
 )
 
+# pandas refuses to colour tables above 262,144 cells by default, and Streamlit turns that into a crash
+pd.set_option("styler.render.max_elements", 20_000_000)
+
 st.set_page_config(page_title="Bank Reconciliation", page_icon="🏦", layout="wide")
 st.title("🏦 Automated Bank Reconciliation")
 st.caption("Bank details on the left • Variance in the middle • Cashbook details on the right")
@@ -154,10 +157,10 @@ if bank_file and cash_file:
     p1, p2 = st.columns(2)
     with p1:
         st.markdown(f"**Bank statement preview** ({len(bank_df)} rows)")
-        st.dataframe(bank_df.head(8), use_container_width=True)
+        st.dataframe(bank_df.head(8), width="stretch")
     with p2:
         st.markdown(f"**ERP cashbook preview** ({len(cash_df)} rows)")
-        st.dataframe(cash_df.head(8), use_container_width=True)
+        st.dataframe(cash_df.head(8), width="stretch")
 
     st.subheader("3. Match the columns")
     mapping = pairing_controls(bank_df, cash_df)
@@ -167,7 +170,7 @@ if bank_file and cash_file:
         st.warning("Select at least one amount column to reconcile.")
 
     signature = (bank_file.name, bank_file.size, cash_file.name, cash_file.size)
-    if st.button("Reconcile transactions", type="primary", use_container_width=True, disabled=nothing_selected):
+    if st.button("Reconcile transactions", type="primary", width="stretch", disabled=nothing_selected):
         try:
             bank_tx = normalize_transactions(bank_df, mapping["bank_in"], mapping["bank_out"], "BANK")
             erp_tx = normalize_transactions(
@@ -205,11 +208,20 @@ if bank_file and cash_file:
                 + "; ".join(f"row {r} ({why})" for r, why in results["skipped"][:10])
             )
 
-        st.dataframe(
-            style_report(results["report_df"], results["statuses"]),
-            use_container_width=True,
-            hide_index=True,
-        )
+        report_df = results["report_df"]
+        try:
+            st.dataframe(
+                style_report(report_df, results["statuses"]),
+                width="stretch",
+                hide_index=True,
+            )
+        except Exception:
+            # Never let colouring stop the report: show a plain table with an explicit Status column
+            st.info("Row colours could not be shown for this file; the Status column shows each row's result. "
+                    "The downloaded Excel report is still fully coloured.")
+            plain = report_df.copy()
+            plain.insert(0, "Status", results["statuses"])
+            st.dataframe(plain, width="stretch", hide_index=True)
 
         st.download_button(
             "⬇️ Download reconciliation report (.xlsx)",
